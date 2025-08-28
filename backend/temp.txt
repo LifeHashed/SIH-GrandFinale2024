@@ -1,0 +1,86 @@
+try:
+        # Validate file type
+        if file.content_type != "application/pdf":
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid file type. Please upload a valid PDF file."
+            )
+
+        # Read the uploaded PDF into memory
+        pdf_data = await file.read()
+        pdf_file = BytesIO(pdf_data)
+
+        # Validate PDF structure
+        try:
+            reader = PdfReader(pdf_file)
+            # Attempt to read the first page to ensure it's a valid PDF
+            _ = reader.pages[0]
+        except PdfReadError:
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded file is not a valid PDF or is corrupted."
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"PDF validation failed: {str(e)}"
+            )
+
+        # Reset BytesIO after validation
+        pdf_file.seek(0)
+
+        # Path to Poppler utilities
+        POPPLER_PATH = r"C:\Users\User\Downloads\Release-24.08.0-0\poppler-24.08.0\Library\bin"  # Adjust for your system
+
+        # Convert PDF to images
+        try:
+            images = convert_from_bytes(pdf_file.read(), poppler_path=POPPLER_PATH)
+        except Exception as poppler_error:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error converting PDF to images. Ensure Poppler is installed and configured correctly. {str(poppler_error)}"
+            )
+
+        # Perform OCR and redact text
+        redacted_images = []
+        for image in images:
+            ocr_text = pytesseract.image_to_string(image)
+            redacted_text = redact_all(redact_entities(ocr_text))
+
+            # Redact sensitive areas on the image
+            draw = ImageDraw.Draw(image)
+            tsv_data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DATAFRAME)
+            for _, row in tsv_data.iterrows():
+                text = row.get("text", "")
+                if isinstance(text, str) and text.strip():
+                    redacted_word = redact_all(redact_entities(text))
+                    if redacted_word != text:
+                        left, top, width, height = int(row['left']), int(row['top']), int(row['width']), int(row['height'])
+                        draw.rectangle([left, top, left + width, top + height], fill="black")
+
+            redacted_images.append(image)
+
+        # Save redacted images as a new PDF
+        output_pdf = BytesIO()
+        redacted_images[0].save(
+            output_pdf,
+            format="PDF",
+            save_all=True,
+            append_images=redacted_images[1:]
+        )
+        output_pdf.seek(0)
+
+        return StreamingResponse(
+            output_pdf,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=redacted_{file.filename}"}
+        )
+
+    except HTTPException as http_err:
+        raise http_err
+    except Exception as e:
+        logging.error(f"Unexpected error during PDF redaction: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
